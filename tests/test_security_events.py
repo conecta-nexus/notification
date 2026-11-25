@@ -395,3 +395,66 @@ def test_handler_failure_is_not_acknowledged(settings):
         response = client.post(URL, json=event, headers=event_headers("application"))
         assert response.status_code == 503
         assert response.json() == {"detail": "Event handler failed."}
+
+
+def test_equal_producer_secrets_cannot_authorize_either_producer(settings):
+    config = settings.model_copy(
+        update={"challenge_event_secret": settings.application_event_secret}
+    )
+    with TestClient(create_app(config)) as client:
+        for producer, event_type in [
+            ("application", "APPLICATION_CREATED"),
+            ("challenge", "CHALLENGE_CLOSED"),
+        ]:
+            headers = event_headers("application") | {"X-Event-Producer": producer}
+            reply = client.post(
+                URL,
+                json={"type": event_type, "payload": EVENTS[event_type]},
+                headers=headers,
+            )
+            assert (reply.status_code, reply.json()) == (
+                401,
+                {"detail": "Invalid or missing producer credentials."},
+            )
+
+
+def test_event_payload_rejects_unknown_fields_and_malformed_uuid(settings):
+    with TestClient(create_app(settings)) as client:
+        for payload in [
+            {**EVENTS["APPLICATION_CREATED"], "email": "private-fixture@example.org"},
+            {**EVENTS["APPLICATION_CREATED"], "company_id": "private-invalid-uuid"},
+        ]:
+            response = client.post(
+                URL,
+                json={"type": "APPLICATION_CREATED", "payload": payload},
+                headers=event_headers("application"),
+            )
+            assert response.status_code == 422
+            assert response.json() == {"detail": "Invalid request payload."}
+
+
+@pytest.mark.parametrize("kind", ["ec", "small-rsa"])
+def test_valid_pem_with_unsupported_key_cannot_authorize_notifications(
+    settings, signer, kind
+):
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    unsuitable = (
+        ec.generate_private_key(ec.SECP256R1())
+        if kind == "ec"
+        else generate_private_key(public_exponent=65537, key_size=1024)
+    )
+    pem = unsuitable.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    )
+    config = settings.model_copy(update={"jwt_public_key": pem.decode()})
+    with TestClient(create_app(config)) as client:
+        response = client.get(
+            "/api/v1/notifications/me",
+            headers=bearer(jwt.encode(claims(), signer, "RS256")),
+        )
+        assert (
+            response.status_code == 401
+            and response.headers["WWW-Authenticate"] == "Bearer"
+        )
+        assert response.headers["Cache-Control"] == "no-store"

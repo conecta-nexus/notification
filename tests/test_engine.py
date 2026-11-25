@@ -4,6 +4,7 @@ import subprocess
 import sys
 from time import monotonic
 from typing import Annotated
+from unittest.mock import Mock
 
 import pytest
 from fastapi import Depends
@@ -15,9 +16,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Settings
 from src.core.database import get_db, ping_database
-from src.main import create_app
+from src.main import app, create_app, load_settings, run
 
 LOST_DATABASE = "postgresql://127.0.0.1:1/notification_test"
+
+
+def test_startup_rejects_invalid_database_configuration_without_disclosing_input(
+    monkeypatch,
+):
+    private = "synthetic-private-connection-value"
+    monkeypatch.setenv("DATABASE_URL", private)
+    with pytest.raises(
+        RuntimeError, match="Invalid Notification settings: database_url"
+    ) as error:
+        load_settings()
+    assert private not in str(error.value)
+    with (
+        pytest.raises(
+            RuntimeError, match="Invalid Notification settings: database_url"
+        ),
+        TestClient(create_app()),
+    ):
+        pytest.fail("Invalid settings must prevent startup")
+
+
+def test_legacy_import_exposes_canonical_app_and_run_uses_runtime_listen_settings(
+    monkeypatch,
+):
+    from src.notification.main import app as legacy_app
+
+    monkeypatch.setenv("DATABASE_URL", LOST_DATABASE)
+    monkeypatch.setenv("HOST", "127.0.0.1")
+    monkeypatch.setenv("PORT", "33333")
+    launch = Mock()
+    monkeypatch.setattr("uvicorn.run", launch)
+    assert legacy_app is app
+    run()
+    launch.assert_called_once_with(app, host="127.0.0.1", port=33333, loop="asyncio")
 
 
 @pytest.mark.parametrize("scheme", ["postgres", "postgresql", "postgresql+asyncpg"])

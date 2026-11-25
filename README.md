@@ -541,3 +541,53 @@ try {
 
 Confirm the selector reports zero skips. Remove only the disposable database
 container and restore the shell variable afterward.
+
+## Comprehensive verification
+
+The suite covers configuration, RSA authentication and producer authorization,
+PostgreSQL models and Alembic migrations, MIME rendering and SMTP behavior,
+and the authenticated notification API. SMTP unit tests replace only the
+transport and parse the bytes passed to `DATA` for all four recipient
+variants. SQL tests use PostgreSQL 16. Router error classification is tested
+separately from real outages, and concurrent write tests use real
+transactions. One test waits between the bulk update and count so that a
+concurrent insert commits before the count snapshot.
+
+From the Notification repository, execute these PowerShell commands with
+Docker Desktop running. The host mode locks dependencies, exports collection,
+runs plain pytest and repeats under branch coverage. Each execution starts
+with its own empty `notification_verify` database. Reports include JUnit,
+coverage JSON, the human-readable coverage table, and synthetic MIME
+captured at the transport boundary.
+
+```powershell
+$verify = [ScriptBlock]::Create((Get-Content -Raw -Encoding UTF8 -LiteralPath 'scripts/verify_tests.ps1'))
+& $verify -Mode Host -ReportDirectory '../.env.local/notification-task-05/review/final'
+& $verify -Mode Docker -ReportDirectory '../.env.local/notification-task-05/review/docker'
+```
+
+Docker mode runs the official complete `pytest -q` inside the existing
+`conecta-notification` container. It uses a unique temporary uv environment
+and a disposable database with a unique hostname on the shared network.
+It checks shared `postgres` resolution, removes the temporary resources and
+restores shell variables. The script requires zero omitted tests and an 80%
+combined coverage threshold for all of `src`. Runtime dependencies and
+migrations remain unchanged.
+
+For real mail delivery use the disposable Mailpit block above. For live HTTP
+regression use real Auth-issued tokens and the documented direct and Gateway
+routes. Persist test fixtures through the model, then remove only their exact
+synthetic UUIDs. These checks exercise separate boundaries and report their
+evidence separately from mocks. Actual producer emission, authorized
+recipient resolution, automatic event storage, durable event idempotency,
+production SMTP, the frontend drawer and Cloud Run acceptance require
+separate integration.
+
+The recorded baseline passed 90 tests. The final suite passed 127 and covered
+599 of 608 statements and 86 of 92 branches. On the recorded run,
+combined coverage rose from 92.71% to 97.86%, statement coverage from
+94.74% to 98.52%, and branch coverage from 79.35% to 93.48%. The query
+module reached 100%. The router measured 88% combined. Its 404, sanitized
+500 and temporary-storage 503 behavior is also directly asserted at the
+HTTP boundary. Refer to the review's per-module report for remaining
+coverage gaps and the tracer comparison.
