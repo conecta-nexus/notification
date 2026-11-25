@@ -218,6 +218,9 @@ try {
         'test_notification_migration_round_trip',
         'test_notification_postgresql_schema_and_index',
         'test_notification_async_persistence_and_read_state'
+        'test_postgres_concurrent_reads_and_bulk'
+        'test_read_and_bulk_persist_without_changing_other_columns'
+        'test_commit_failure_is_sanitized_and_rolls_back'
     )
     foreach ($test in $dbTests) {
         if ($results.SelectNodes("//testcase[@name='$test']").Count -ne 1) {
@@ -438,3 +441,103 @@ try {
     docker exec conecta-notification python -c 'import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' $venv
 }
 ```
+
+## User notification API
+
+Use an Auth-issued Bearer access token. Every operation uses the verified JWT
+subject as the recipient UUID, including for administrators. Gateway's
+diagnostic proxy does not bypass this verification. Responses from the routes
+use `Cache-Control: no-store`.
+
+| Method | Canonical path | Request |
+| --- | --- | --- |
+| GET | `/api/v1/notifications/me` | `limit` defaults to 50 (1–100). `offset` defaults to 0 (0–2147483647) |
+| PATCH | `/api/v1/notifications/{notification_id}/read` | UUID path parameter. No body required. An empty JSON object or null also works |
+| PATCH | `/api/v1/notifications/read-all` | No body required. An empty JSON object or null also works |
+
+In Nuxt's `useApi().apiFetch`, pass `/notifications/me`,
+`/notifications/${id}/read`, or `/notifications/read-all`. The composable
+supplies `/api/v1` and Authorization. Poll GET `/me` for the badge and use
+the returned `unread_count` after each PATCH.
+
+```json
+{
+  "items": [
+    {
+      "id": "f9326796-61ae-4e88-8893-6d893b44897d",
+      "event_type": "APPLICATION_ACCEPTED",
+      "title": "Postulación aceptada",
+      "message": "Tu postulación ha sido aceptada.",
+      "link_url": "/challenges",
+      "is_read": false,
+      "created_at": "2026-11-25T22:00:00Z"
+    }
+  ],
+  "unread_count": 1
+}
+```
+
+`event_type` is the stored string. IDs are UUID strings and times use ISO 8601
+UTC. Links are root-relative printable ASCII paths. Encoded paths, dot
+segments, queries, fragments, backslashes and external or executable
+destinations are returned as null. The stored value stays intact. The frontend
+should still allow only supported same-origin destinations before navigating.
+
+The list orders by `created_at DESC, id DESC`. Advance the offset by the
+number of items returned, and stop when a page returns fewer than the requested
+limit. An empty page returns `items: []`, while the unread count always covers
+the entire owner history. The page and count share a PostgreSQL statement
+snapshot. Offset positions can shift between requests when rows are inserted.
+
+Single PATCH returns
+`{"id":"f9326796-61ae-4e88-8893-6d893b44897d","is_read":true,"unread_count":0}`.
+Bulk PATCH returns `{"updated_count":1,"unread_count":0}`. Only unread rows
+transition. Repeating bulk PATCH returns zero newly updated rows once no owned
+unread rows remain. Writes commit before success. Their count is computed in a
+second statement inside the same READ COMMITTED transaction. A notification
+committed by another transaction before that statement can produce a positive
+count after bulk read. Arrivals after that snapshot appear on later requests.
+
+Errors use `{"detail":"..."}`. Missing or invalid authentication returns 401
+with a Bearer challenge at Notification. An unknown or foreign UUID returns
+the same 404. Invalid UUIDs, out-of-range pagination and PATCH payload fields
+return 422. Recognized connectivity failures return 503, and unexpected
+database failures return a generic 500. Failed transactions roll back.
+
+`GET /openapi.json` and `/docs` on the direct service describe the API.
+The disposable PostgreSQL verification above runs the API, inherited tests,
+and migration checks with actual PostgreSQL and Alembic. The API fixtures
+seed records using the real model and clean only test-created users' rows.
+For live Gateway checks, use Auth-issued synthetic identities and the same
+Bearer requests at ports 8006 and 8080. Use POST `/api/v1/auth/login`,
+verify the token with GET `/api/v1/auth/verify`, and keep credentials and
+tokens out of recorded output. Any committed shared smoke-test rows must be
+tracked and removed by exact synthetic UUID. The storage model has no new
+migration. Delivery from real Application or Challenge publishers and
+frontend integration remain separate tasks.
+
+### Official router test selector in Docker
+
+Use a disposable PostgreSQL 16 database named `notification_verify` and a
+unique hostname reachable by `conecta-notification`. Keep any test database
+on a separate network for the full host suite. For the in-container selector,
+if attaching the disposable database to the shared network, give it a
+unique container name and never advertise the `postgres` hostname.
+
+From the workspace root, run the following with a disposable DSN in
+`TEST_DATABASE_URL`. Docker forwards its value through the environment.
+The isolated test virtual environment leaves the runtime dependencies intact.
+
+```powershell
+if (-not $env:TEST_DATABASE_URL) { throw 'Provide a disposable test database.' }
+$venv = '/tmp/notify-api-pytest-' + [Guid]::NewGuid().ToString('N')
+try {
+    docker exec -e TEST_DATABASE_URL -e UV_NO_DEV=0 -e "UV_PROJECT_ENVIRONMENT=$venv" conecta-notification uv run --dev --locked pytest tests/test_notification_router.py
+    if ($LASTEXITCODE -ne 0) { throw 'Notification router selector failed.' }
+} finally {
+    docker exec conecta-notification python -c 'import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' $venv
+}
+```
+
+Confirm the selector reports zero skips. Remove only the disposable database
+container and restore the shell variable afterward.
