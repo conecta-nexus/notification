@@ -1,0 +1,14 @@
+Conecta Nexus
+{{ subject }}
+
+{% if email.recipient_role == "student" -%}
+Tu postulación al reto {{ email.challenge_title }} fue aceptada. Puedes contactar a la empresa para coordinar los siguientes pasos.
+{% else -%}
+Se confirmó la aceptación de una postulación al reto {{ email.challenge_title }}. Puedes contactar al estudiante para coordinar los siguientes pasos.
+{% endif %}
+Contacto para coordinar: {{ email.counterparty.name }}
+{% if email.counterparty.email %}Correo: {{ email.counterparty.email }}
+{% endif -%}
+{% if email.counterparty.phone %}Teléfono: {{ email.counterparty.phone }}
+{% endif %}
+{{ action_label }}: {{ action_url }}

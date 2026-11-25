@@ -1,0 +1,9 @@
+Conecta Nexus
+{{ subject }}
+
+Tu postulación al reto {{ email.challenge_title }} no fue aceptada. Gracias por el interés y el tiempo que dedicaste a postularte.
+{% if email.feedback %}
+Comentarios de la empresa:
+{{ email.feedback }}
+{% endif %}
+{{ action_label }}: {{ action_url }}

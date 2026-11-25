@@ -1,7 +1,14 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import (
+    AnyHttpUrl,
+    EmailStr,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -40,6 +47,80 @@ class Settings(BaseSettings):
     )
     application_event_secret: ProducerSecret | None = None
     challenge_event_secret: ProducerSecret | None = None
+    smtp_host: str | None = None
+    smtp_port: int = Field(default=1025, ge=1, le=65535)
+    smtp_username: SecretStr | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from_email: EmailStr | None = None
+    smtp_from_name: str = "Conecta Nexus"
+    smtp_tls_mode: Literal["plain", "starttls", "tls"] = "plain"
+    smtp_timeout: float = Field(default=10, gt=0, le=120, allow_inf_nan=False)
+    smtp_retry_base_delay: float = Field(default=1, gt=0, le=60, allow_inf_nan=False)
+    frontend_base_url: AnyHttpUrl | None = None
+
+    @field_validator(
+        "smtp_host",
+        "smtp_username",
+        "smtp_password",
+        "smtp_from_email",
+        "frontend_base_url",
+        mode="before",
+    )
+    @classmethod
+    def empty_optional_email_settings(cls, value):
+        if value == "":
+            return None
+        return value
+
+    @field_validator("smtp_from_email", mode="before")
+    @classmethod
+    def safe_sender(cls, value):
+        if value is not None and (
+            not isinstance(value, str)
+            or not value.isascii()
+            or any(ch.isspace() or ch in "<>" for ch in value)
+        ):
+            raise ValueError("Provide one plain ASCII sender address.")
+        return value
+
+    @field_validator("smtp_from_name")
+    @classmethod
+    def safe_sender_name(cls, value):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError("Sender name contains a control character.")
+        return value
+
+    @field_validator("frontend_base_url")
+    @classmethod
+    def frontend_origin(cls, value):
+        if value and (
+            value.username
+            or value.password
+            or value.path != "/"
+            or value.query is not None
+            or value.fragment is not None
+        ):
+            raise ValueError(
+                "Provide a frontend origin without credentials, path, query or fragment."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def smtp_transport_policy(self):
+        if self.smtp_host:
+            if not self.smtp_host.isascii() or any(
+                ch.isspace() or ord(ch) < 32 for ch in self.smtp_host
+            ):
+                raise ValueError("Provide a valid SMTP host.")
+            if bool(self.smtp_username) != bool(self.smtp_password):
+                raise ValueError("Configure both SMTP credentials or neither.")
+            if self.smtp_tls_mode == "plain" and (
+                self.smtp_username or self.app_env == "production"
+            ):
+                raise ValueError(
+                    "SMTP credentials and production delivery require TLS."
+                )
+        return self
 
     @field_validator(
         "application_event_secret", "challenge_event_secret", mode="before"

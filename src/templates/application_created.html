@@ -1,0 +1,6 @@
+{% extends "email_base.html" %}
+{% block body %}
+<p style="margin:0 0 14px">Recibiste una postulación al reto <strong>{{ email.challenge_title }}</strong>.</p>
+{% if email.student_name %}<p style="margin:0 0 14px">Estudiante: {{ email.student_name }}</p>{% endif %}
+<p style="margin:0">Ingresa a la gestión de tus retos para revisar la postulación.</p>
+{% endblock %}

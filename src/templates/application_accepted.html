@@ -1,0 +1,14 @@
+{% extends "email_base.html" %}
+{% block body %}
+{% if email.recipient_role == "student" %}
+<p style="margin:0 0 14px">Tu postulación al reto <strong>{{ email.challenge_title }}</strong> fue aceptada. Puedes contactar a la empresa para coordinar los siguientes pasos.</p>
+{% else %}
+<p style="margin:0 0 14px">Se confirmó la aceptación de una postulación al reto <strong>{{ email.challenge_title }}</strong>. Puedes contactar al estudiante para coordinar los siguientes pasos.</p>
+{% endif %}
+<div style="padding:14px 16px;background:#e8effd;border-radius:8px">
+<h2 style="font-size:18px;margin:0 0 8px">Contacto para coordinar</h2>
+<p style="margin:0"><strong>{{ email.counterparty.name }}</strong>
+{% if email.counterparty.email %}<br>Correo: {{ email.counterparty.email }}{% endif %}
+{% if email.counterparty.phone %}<br>Teléfono: {{ email.counterparty.phone }}{% endif %}</p>
+</div>
+{% endblock %}

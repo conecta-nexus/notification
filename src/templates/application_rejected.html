@@ -1,0 +1,10 @@
+{% extends "email_base.html" %}
+{% block body %}
+<p style="margin:0 0 14px">Tu postulación al reto <strong>{{ email.challenge_title }}</strong> no fue aceptada. Gracias por el interés y el tiempo que dedicaste a postularte.</p>
+{% if email.feedback %}
+<div style="padding:14px 16px;background:#f7f2ee;border-radius:8px">
+<h2 style="font-size:18px;margin:0 0 8px">Comentarios de la empresa</h2>
+<p style="margin:0;white-space:pre-wrap">{{ email.feedback }}</p>
+</div>
+{% endif %}
+{% endblock %}
