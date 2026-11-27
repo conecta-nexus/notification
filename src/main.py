@@ -11,6 +11,7 @@ from src.core.security import load_verification_key
 from src.routers.events import router
 from src.routers.notifications import router as notifications_router
 from src.services.event_dispatcher import EventDispatcher
+from src.services.runtime_handlers import build_runtime_dispatcher
 
 
 def load_settings() -> Settings:
@@ -24,20 +25,29 @@ def load_settings() -> Settings:
 
 
 def create_app(
-    settings: Settings | None = None, dispatcher: EventDispatcher | None = None
+    settings: Settings | None = None,
+    dispatcher: EventDispatcher | None = None,
+    *,
+    default_handlers: bool = False,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         config = settings if settings is not None else load_settings()
         application.state.settings = config
-        application.state.dispatcher = (
-            dispatcher if dispatcher is not None else EventDispatcher()
-        )
         application.state.verification_key = load_verification_key(config)
         engine = create_engine(config)
+        session_factory = create_session_factory(engine)
         try:
             application.state.engine = engine
-            application.state.session_factory = create_session_factory(engine)
+            application.state.session_factory = session_factory
+            if dispatcher is not None:
+                application.state.dispatcher = dispatcher
+            elif default_handlers:
+                application.state.dispatcher = build_runtime_dispatcher(
+                    config, session_factory
+                )
+            else:
+                application.state.dispatcher = EventDispatcher()
             yield
         finally:
             await engine.dispose()
@@ -73,7 +83,7 @@ def create_app(
     return application
 
 
-app = create_app()
+app = create_app(default_handlers=True)
 
 
 def run():

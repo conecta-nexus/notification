@@ -23,6 +23,9 @@ RUN uv sync --locked --no-install-project --no-dev
 # Copy application source code
 COPY . .
 
+RUN chmod +x entrypoint.sh
+
 EXPOSE 8000
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "-m", "src.main"]
