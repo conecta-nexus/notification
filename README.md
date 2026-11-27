@@ -4,7 +4,7 @@ FastAPI entrypoint `src.main:app`. `src.notification.main:app` re-exports the
 same app for compatibility. Importing either entrypoint performs no network
 I/O. The application lifespan creates one asyncpg pool and session factory per
 worker and disposes the engine during shutdown. Use `get_db` for request-scoped
-SQLAlchemy sessions. Task #4 initializes infrastructure without creating tables.
+SQLAlchemy sessions. Apply schema changes explicitly with Alembic.
 
 ## Configuration
 
@@ -173,6 +173,7 @@ $id = 'notification-verify-' + [Guid]::NewGuid().ToString('N')
 $network = $id + '-net'
 $junit = Join-Path ([IO.Path]::GetTempPath()) ($id + '.xml')
 $coverageFile = Join-Path ([IO.Path]::GetTempPath()) ($id + '.coverage')
+$coverageJson = Join-Path ([IO.Path]::GetTempPath()) ($id + '.coverage.json')
 $previous = @{}
 foreach ($name in 'TEST_DATABASE_URL', 'POSTGRES_PASSWORD', 'COVERAGE_FILE', 'UV_PYTHON') {
     $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -212,16 +213,32 @@ try {
     uv run coverage run --branch --source=src -m pytest "--junitxml=$junit"
     if ($LASTEXITCODE -ne 0) { throw 'Pytest failed.' }
     [xml]$results = Get-Content -Raw -LiteralPath $junit
-    $dbTest = $results.SelectNodes("//testcase[@name='test_postgresql_pool_sessions_health_timeout_and_disposal']")
-    if ($dbTest.Count -ne 1 -or $results.SelectNodes('//testcase/skipped').Count -ne 0) {
-        throw 'Expected a full suite with the PostgreSQL integration test and zero skips.'
+    $dbTests = @(
+        'test_postgresql_pool_sessions_health_timeout_and_disposal',
+        'test_notification_migration_round_trip',
+        'test_notification_postgresql_schema_and_index',
+        'test_notification_async_persistence_and_read_state'
+    )
+    foreach ($test in $dbTests) {
+        if ($results.SelectNodes("//testcase[@name='$test']").Count -ne 1) {
+            throw "Missing PostgreSQL case $test."
+        }
+    }
+    if ($results.SelectNodes('//testcase/skipped').Count -ne 0) {
+        throw 'Expected zero skips.'
     }
     uv run coverage report -m --fail-under=80
     if ($LASTEXITCODE -ne 0) { throw 'Coverage verification failed.' }
+    uv run coverage json -o $coverageJson
+    if ($LASTEXITCODE -ne 0) { throw 'Coverage export failed.' }
+    uv run python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1],encoding=''utf-8''))[''totals'']))' $coverageJson
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read coverage totals.' }
+    uv run python -m scripts.benchmark_notifications
+    if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL benchmark failed to run.' }
 } finally {
     if ($containerId) { docker rm -f $containerId | Out-Null }
     if ($networkId) { docker network rm $networkId | Out-Null }
-    foreach ($path in $junit, $coverageFile) {
+    foreach ($path in $junit, $coverageFile, $coverageJson) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
     foreach ($name in $previous.Keys) {
@@ -233,6 +250,71 @@ try {
 When health returns 503, check the effective database name, the Docker network
 and deployment credentials without printing the DSN. For unexpected 401s,
 check the mounted public-key fingerprint and whether the credential is an Auth
-access token or a producer secret for the endpoint in question. Tasks #5–#8
-cover SMTP, Notification persistence, read-state endpoints and comprehensive
-service tests. The Application and Challenge producers remain separate work.
+access token or a producer secret for the endpoint in question. Tasks #5, #7
+and #8 cover SMTP, the user-facing API and comprehensive service tests. The
+Application and Challenge producers remain separate work.
+
+## Notification storage
+
+Revision `001` creates `public.notifications` in `db_notifications`.
+Alembic uses the same Settings as the service and a separate, short-lived
+asyncpg engine with `NullPool`. The runtime image includes the Alembic CLI.
+The application lifespan does not run migrations.
+
+| Column | PostgreSQL type | Rules |
+| --- | --- | --- |
+| `id` | UUID | Primary key. ORM generates UUID4 and PostgreSQL defaults to `gen_random_uuid()` |
+| `user_id` | UUID | Required Auth user UUID from JWT `sub`. A user can have many rows. No cross-service foreign key |
+| `event_type` | VARCHAR | Required. Supports all four current event values and future additions |
+| `title` | VARCHAR | Required |
+| `message` | TEXT | Required |
+| `link_url` | VARCHAR | Optional. Use NULL when there is no navigation destination |
+| `is_read` | BOOLEAN | Required and defaults to false in the ORM and PostgreSQL |
+| `created_at` | TIMESTAMP WITH TIME ZONE | Required. ORM supplies UTC and PostgreSQL defaults to `now()`. Updating the read state preserves the original time |
+
+The published contracts specify no VARCHAR limits. Application and frontend
+code can enforce presentation limits as needed. The B-Tree index
+`ix_notifications_user_id_is_read_created_at` orders columns as
+`(user_id, is_read, created_at)`. PostgreSQL can scan it backward for
+newest-first unread results and use its leading columns for unread counts.
+Future endpoints own authorization, read-state changes and navigation. The
+current event dispatcher does not automatically create records or deliver mail.
+
+### Apply the schema
+
+With the Notification container rebuilt, first verify that its configured
+target is the intended PostgreSQL 16 `db_notifications` database and inspect
+its schema and revision. Investigate unexpected tables or revision history
+before applying migrations. From the workspace root:
+
+```powershell
+docker exec conecta-notification uv run alembic upgrade head
+docker exec conecta-notification uv run alembic current
+docker exec conecta-notification uv run alembic heads
+docker exec conecta-notification uv run alembic check
+```
+
+Alembic also supports `history` and offline `upgrade head --sql`.
+**Downgrading revision 001 drops the notifications table and its history.**
+Test `downgrade base` only with disposable data. Use a backup and a separately
+reviewed recovery procedure for any production rollback that must retain rows.
+
+### Verify index performance
+
+The PowerShell verification block runs `scripts.benchmark_notifications` on
+the disposable database after the migration suite. The benchmark inserts
+120,000 synthetic rows across 1,010 recipients, including ten with 2,000 rows
+and a thousand with 100 rows. One third of rows are read. It runs `ANALYZE`
+and captures JSON plans for a page of 20 unread rows and the unread count.
+It measures an initial query after loading, followed by 30 repeats per
+recipient without forcing the planner, and rolls back its fixture.
+
+The results are database execution times. Loading the dataset and checking
+cardinalities may already warm shared buffers, and the measured times exclude
+network, client and HTTP latency. They characterize the test dataset and
+environment.
+
+On the local PostgreSQL 16.15 run, the normal planner chose the compound
+index for all 155 page queries. The 150 repeated queries took at most
+0.183 ms, with per-recipient p95 from 0.046 to 0.130 ms. The five initial
+page queries took 0.036 to 0.112 ms.
