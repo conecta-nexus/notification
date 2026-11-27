@@ -9,6 +9,7 @@ from src.core.config import Settings
 from src.core.database import create_engine, create_session_factory, ping_database
 from src.core.security import load_verification_key
 from src.routers.events import router
+from src.routers.notifications import router as notifications_router
 from src.services.event_dispatcher import EventDispatcher
 
 
@@ -45,6 +46,7 @@ def create_app(
         title="Conecta Nexus - Notification Service", version="0.1.0", lifespan=lifespan
     )
     application.include_router(router)
+    application.include_router(notifications_router)
 
     @application.get("/")
     async def read_root():
