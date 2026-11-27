@@ -1,0 +1,9 @@
+Conecta Nexus
+{{ subject }}
+
+Recibiste una postulación al reto {{ email.challenge_title }}.
+{% if email.student_name %}Estudiante: {{ email.student_name }}
+{% endif %}
+Ingresa a la gestión de tus retos para revisar la postulación.
+
+{{ action_label }}: {{ action_url }}

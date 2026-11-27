@@ -318,3 +318,123 @@ On the local PostgreSQL 16.15 run, the normal planner chose the compound
 index for all 155 page queries. The 150 repeated queries took at most
 0.183 ms, with per-recipient p95 from 0.046 to 0.130 ms. The five initial
 page queries took 0.036 to 0.112 ms.
+
+## Transactional email
+
+Use `await EmailDispatcher(settings).send(context)` with a typed
+`CreatedEmail`, `AcceptedEmail`, or `RejectedEmail` from
+`src/services/email_rendering.py`. Each context requires one recipient
+mailbox and a human-readable challenge title. Creation goes to the company
+and can include the authorized student display name. Acceptance uses a
+separate student and company context, each with only its counterparty's
+authorized name and at least one email or phone. Rejection goes to the
+student and includes optional feedback. Supply a per-recipient UUID as
+`delivery_id` when a caller has stable delivery identity.
+
+Templates use Jinja strict undefined handling and HTML autoescaping. MIME
+has UTF-8 plain text and HTML alternatives with a single To header. The
+wordmark and palette reproduce the project styling documented in
+`frontend/DESIGN.md` and `frontend/app/components/landing/LandingNavbar.vue`.
+The navbar defines a text wordmark with a crimson dot. There is no separate
+approved illustration in that component. The email uses the same text
+treatment and does not need image downloads or a tracking pixel.
+Buttons use the configured origin and fixed existing paths `/challenges/manage`,
+`/me`, or `/challenges`. Application detail navigation awaits a confirmed route.
+
+### SMTP settings
+
+| Variable | Contract |
+| --- | --- |
+| `SMTP_HOST` | Empty disables delivery. Use `127.0.0.1` for host-local Mailpit |
+| `SMTP_PORT` | Defaults to `1025`. Configure the actual deployed SMTP port |
+| `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME` | Sender mailbox and display name. The name defaults to Conecta Nexus |
+| `SMTP_TLS_MODE` | `plain` for local unauthenticated Mailpit, `starttls` for mandatory upgrade, or `tls` for implicit TLS |
+| `SMTP_USERNAME`, `SMTP_PASSWORD` | Optional pair. Authentication requires TLS |
+| `SMTP_TIMEOUT` | Total attempt deadline in seconds, default `10` |
+| `SMTP_RETRY_BASE_DELAY` | First retry delay in seconds, default `1` |
+| `FRONTEND_BASE_URL` | Trusted HTTP(S) origin. Paths, credentials, query strings and fragments are rejected |
+
+Production delivery requires TLS and certificate verification. Configure
+the deployed SMTP host and port explicitly. Runtime empty optional values
+override dotenv. Disabled SMTP preserves normal application health and
+raises a typed delivery failure when invoked. No shared SMTP variables are
+needed for the verification harness.
+
+The dispatcher returns a receipt only after SMTP accepts DATA. It retries
+connection failures before DATA and explicit temporary SMTP replies, with
+at most three total attempts and base/double-base delays. Permanent replies
+and certificate failures terminate immediately. A disconnect or timeout
+during DATA is ambiguous and is never retried automatically. One operation
+keeps the same Message-ID. Logs and exceptions expose only the failure
+class and attempt count. A Message-ID provides correlation and does not
+deduplicate across events.
+
+`application_email_handlers` connects an explicitly authorized,
+asynchronous context resolver to the existing EventDispatcher. An accepted
+event attempts each recipient once per operation, preserving partial
+results without repeating the successful recipient inside that operation.
+There is no production resolver and no persistent delivery ledger. The root
+Application producer, recipient lookup and contacts contract remain
+external dependencies. Do not automatically replay partial or ambiguous
+operations until durable recipient-level reconciliation exists.
+
+### Verify delivery with disposable Mailpit
+
+From the Notification repository, run this PowerShell block with ports
+1025 and 8025 available. It binds both to loopback on an isolated Docker
+network and removes its own resources. The harness creates its own
+temporary authorized HTTP producer and uses only synthetic addresses.
+The output directory contains the SMTP-captured MIME, HTML and plain text.
+
+```powershell
+$name = 'notification-mailpit-' + [Guid]::NewGuid().ToString('N')
+$network = $name + '-net'
+$output = Join-Path ([IO.Path]::GetTempPath()) $name
+$networkId = $null
+$container = $null
+try {
+    $networkId = docker network create $network
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create Mailpit network.' }
+    $mailpitArgs = @(
+        'run', '-d', '--rm', '--name', $name, '--network', $networkId,
+        '-p', '127.0.0.1:1025:1025', '-p', '127.0.0.1:8025:8025',
+        'axllent/mailpit@sha256:c076638db1e15662150be4fb62b8a6e96ef6ba5bde90c838a0239225854830f7'
+    )
+    $container = docker @mailpitArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Mailpit failed to start. Check the port owner before retrying.' }
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        try {
+            $ready = (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8025/' -TimeoutSec 2).StatusCode -eq 200
+            if ($ready) { break }
+        } catch { Start-Sleep -Seconds 1 }
+    }
+    if (-not $ready) { throw 'Mailpit UI did not become ready.' }
+    uv run --locked python -m scripts.verify_email $output
+    if ($LASTEXITCODE -ne 0) { throw 'Mailpit verification failed.' }
+    Write-Output "Captured evidence: $output"
+} finally {
+    if ($container) { docker rm -f $container | Out-Null }
+    if ($networkId) { docker network rm $networkId | Out-Null }
+}
+```
+
+The UI is at `http://127.0.0.1:8025/` while the container is running. Open
+individual captured messages to inspect the HTML, plain text and source.
+The harness uses the [Mailpit v1 API](https://mailpit.axllent.org/docs/api-v1/)
+to collect only the fixture Message-IDs, confirm recovery after a connection
+closed before the SMTP greeting, and verify that terminal failure produces
+no captured message.
+
+Run the full suite using the disposable PostgreSQL procedure above. For
+the official selector, from the workspace root run:
+
+```powershell
+$venv = '/tmp/email-pytest-' + [Guid]::NewGuid().ToString('N')
+try {
+    docker exec -e UV_NO_DEV=0 -e "UV_PROJECT_ENVIRONMENT=$venv" conecta-notification uv run --dev --locked pytest tests/test_email_service.py
+    if ($LASTEXITCODE -ne 0) { throw 'Email pytest selector failed.' }
+} finally {
+    docker exec conecta-notification python -c 'import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' $venv
+}
+```
