@@ -1,4 +1,7 @@
 .git
+.env
+.env.*
+certs/
 .github
 .venv
 __pycache__

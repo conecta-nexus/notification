@@ -10,9 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT="/venv" \
     PATH="/venv/bin:$PATH" \
-    DATABASE_URL="postgresql+asyncpg://postgres:postgrespassword@postgres:5432/db_notifications" \
-    DB_ECHO="false" \
-    APP_ENV="development"
+    UV_NO_DEV=1
 
 WORKDIR /app
 
@@ -20,14 +18,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock* ./
 
 # Install project dependencies
-RUN uv sync --frozen --no-install-project --no-dev || uv sync --no-install-project --no-dev
+RUN uv sync --locked --no-install-project --no-dev
 
 # Copy application source code
 COPY . .
 
-# Final project sync
-RUN uv sync --frozen --no-dev || uv sync --no-dev
-
 EXPOSE 8000
 
-CMD ["uvicorn", "src.notification.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "src.main"]
