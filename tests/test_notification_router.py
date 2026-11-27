@@ -4,6 +4,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from time import time
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import jwt
@@ -14,11 +15,19 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Settings
 from src.core.database import create_engine
 from src.main import create_app
 from src.models.notification import Notification
+from src.services.notification_queries import (
+    list_notifications,
+    mark_all_read,
+    mark_notification_read,
+)
 
 BASE = "/api/v1/notifications"
 ME = BASE + "/me"
@@ -292,7 +301,7 @@ async def test_postgres_concurrent_reads_and_bulk(runtime, key):
 @pytest.mark.asyncio
 async def test_commit_failure_is_sanitized_and_rolls_back(runtime, key):
     client, sessions, (owner, other, _) = runtime
-    first, _, _, _ = await fixture_rows(sessions, owner, other)
+    first, second, _, foreign = await fixture_rows(sessions, owner, other)
     async with sessions.begin() as session:
         await session.execute(
             text("""
@@ -315,6 +324,15 @@ async def test_commit_failure_is_sanitized_and_rolls_back(runtime, key):
         )
         async with sessions() as session:
             assert not (await session.get(Notification, first.id)).is_read
+        reply = await client.patch(ALL, headers=authorization(key, owner))
+        assert (reply.status_code, reply.json()) == (
+            500,
+            {"detail": "Could not complete notification operation."},
+        )
+        async with sessions() as session:
+            for original in (first, second, foreign):
+                current = await session.get(Notification, original.id)
+                assert not current.is_read and current.created_at == original.created_at
     finally:
         async with sessions.begin() as session:
             await session.execute(
@@ -323,6 +341,167 @@ async def test_commit_failure_is_sanitized_and_rolls_back(runtime, key):
             await session.execute(
                 text("DROP FUNCTION verify_fail_notification_write()")
             )
+
+
+@pytest.mark.asyncio
+async def test_queries_preserve_global_unread_count_across_empty_page_and_repeat(
+    runtime,
+):
+    _, sessions, (owner, other, empty) = runtime
+    first, second, _, foreign = await fixture_rows(sessions, owner, other)
+    async with sessions() as session:
+        page = await list_notifications(session, owner, 1, 100)
+        assert page.items == [] and page.unread_count == 2
+        personal = await list_notifications(session, empty, 1, 0)
+        assert personal.items == [] and personal.unread_count == 0
+    for identifier, expected in [
+        (foreign.id, None),
+        (first.id, 1),
+        (first.id, 1),
+        (second.id, 0),
+    ]:
+        async with sessions() as session:
+            result = await mark_notification_read(session, owner, identifier)
+            if expected is None:
+                assert result is None
+            else:
+                assert (
+                    result.id == identifier
+                    and result.is_read
+                    and result.unread_count == expected
+                )
+    async with sessions() as session:
+        assert (await mark_all_read(session, owner)).model_dump() == {
+            "updated_count": 0,
+            "unread_count": 0,
+        }
+    async with sessions() as session:
+        assert not (await session.get(Notification, foreign.id)).is_read
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bulk_counts_each_transition_once_and_keeps_owners_separate(
+    runtime, key
+):
+    client, sessions, (owner, other, _) = runtime
+    rows = await fixture_rows(sessions, owner, other)
+    pairs = [owner, owner, other, other]
+    responses = await asyncio.gather(
+        *[client.patch(ALL, headers=authorization(key, user)) for user in pairs]
+    )
+    assert all(response.status_code == 200 for response in responses)
+    assert [
+        sum(
+            response.json()["updated_count"]
+            for response, user in zip(responses, pairs, strict=True)
+            if user == expected
+        )
+        for expected in (owner, other)
+    ] == [2, 1]
+    assert all(response.json()["unread_count"] == 0 for response in responses)
+    async with sessions() as session:
+        for original in rows:
+            current = await session.get(Notification, original.id)
+            assert current.is_read
+            assert (current.user_id, current.created_at) == (
+                original.user_id,
+                original.created_at,
+            )
+
+
+@pytest.mark.asyncio
+async def test_arrival_between_bulk_update_and_count_remains_unread(runtime):
+    _, sessions, (owner, other, _) = runtime
+    first, second, _, foreign = await fixture_rows(sessions, owner, other)
+    counting = asyncio.Event()
+    inserted = asyncio.Event()
+
+    class CountCheckpoint(AsyncSession):
+        async def scalar(self, *args, **kwargs):
+            counting.set()
+            await inserted.wait()
+            return await super().scalar(*args, **kwargs)
+
+    async def add_concurrent_notification():
+        await counting.wait()
+        async with sessions.begin() as session:
+            new = Notification(
+                user_id=owner,
+                title="Synthetic arrival",
+                message="During read",
+                event_type="APPLICATION_CREATED",
+            )
+            session.add(new)
+            await session.flush()
+            identifier = new.id
+        inserted.set()
+        return identifier
+
+    async with sessions() as regular:
+        engine = regular.bind
+    async with (
+        CountCheckpoint(bind=engine) as checkpoint,
+        asyncio.timeout(10),
+        asyncio.TaskGroup() as group,
+    ):
+        operation = group.create_task(mark_all_read(checkpoint, owner))
+        arrival = group.create_task(add_concurrent_notification())
+    assert operation.result().model_dump() == {"updated_count": 2, "unread_count": 1}
+    async with sessions() as session:
+        new = await session.get(Notification, arrival.result())
+        assert new.user_id == owner and not new.is_read
+        for original in (first, second, foreign):
+            current = await session.get(Notification, original.id)
+            assert current.created_at == original.created_at
+            assert current.is_read == (original.user_id == owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["pool", "invalidated", "08006", "57P01", "57P02", "57P03", "53300", "23514"],
+)
+async def test_real_router_sanitizes_storage_error_classification(
+    key, monkeypatch, caplog, reason
+):
+    class DriverFailure(Exception):
+        sqlstate = reason
+
+    error = (
+        PoolTimeout("synthetic private storage detail")
+        if reason == "pool"
+        else DBAPIError(
+            "synthetic SELECT",
+            {"secret": "synthetic private storage detail"},
+            DriverFailure("synthetic private storage detail"),
+            connection_invalidated=reason == "invalidated",
+        )
+    )
+    probe = AsyncMock(side_effect=error)
+    monkeypatch.setattr("src.routers.notifications.list_notifications", probe)
+    app = create_app(settings(key))
+    owner = uuid4()
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app), base_url="http://test") as client,
+    ):
+        response = await client.get(ME, headers=authorization(key, owner))
+        assert response.headers["Cache-Control"] == "no-store"
+        assert probe.await_args.args[1] == owner
+        if reason == "23514":
+            assert (response.status_code, response.json()) == (
+                500,
+                {"detail": "Could not complete notification operation."},
+            )
+            assert "Unexpected notification database error." in caplog.text
+        else:
+            assert (response.status_code, response.json()) == (
+                503,
+                {"detail": "Notification storage temporarily unavailable."},
+            )
+            assert "Unexpected notification database error." not in caplog.text
+        assert "synthetic" not in response.text + caplog.text
+        assert app.state.engine.pool.checkedout() == 0
 
 
 @pytest.mark.asyncio
@@ -466,4 +645,32 @@ def test_openapi_models_auth_optional_body_and_uuid():
     assert (
         document["components"]["schemas"]["MarkReadRequest"]["additionalProperties"]
         is False
+    )
+    schemas = document["components"]["schemas"]
+    assert (
+        schemas["NotificationItem"]["properties"]["created_at"]["format"] == "date-time"
+    )
+    assert {"type": "null"} in schemas["NotificationItem"]["properties"]["link_url"][
+        "anyOf"
+    ]
+    assert set(schemas["NotificationList"]["properties"]) == {"items", "unread_count"}
+    assert schemas["NotificationList"]["properties"]["unread_count"]["minimum"] == 0
+    assert schemas["MarkAllReadResult"]["properties"]["updated_count"]["minimum"] == 0
+    params = {
+        item["name"]: item["schema"] for item in operations[ME]["get"]["parameters"]
+    }
+    assert (
+        params["limit"]["default"],
+        params["limit"]["minimum"],
+        params["limit"]["maximum"],
+    ) == (50, 1, 100)
+    assert (
+        params["offset"]["default"],
+        params["offset"]["minimum"],
+        params["offset"]["maximum"],
+    ) == (0, 0, 2147483647)
+    assert all(
+        "500" in operation["responses"]
+        for methods in operations.values()
+        for operation in methods.values()
     )
